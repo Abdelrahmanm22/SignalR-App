@@ -1,3 +1,7 @@
+using Microsoft.EntityFrameworkCore;
+using SignalRTestApp.Hubs;
+using SignalRTestApp.Models;
+
 namespace SignalRTestApp
 {
     public class Program
@@ -8,6 +12,8 @@ namespace SignalRTestApp
 
             // Add services to the container.
             builder.Services.AddControllersWithViews();
+            builder.Services.AddSignalR();
+            builder.Services.AddDbContext<ChatContext>(op => op.UseSqlServer(builder.Configuration.GetConnectionString("DefaultConnection")));
 
             var app = builder.Build();
 
@@ -25,9 +31,10 @@ namespace SignalRTestApp
             app.UseAuthorization();
 
             app.MapStaticAssets();
+            app.MapHub<ChatHub>("/chat");
             app.MapControllerRoute(
                 name: "default",
-                pattern: "{controller=Home}/{action=Index}/{id?}")
+                pattern: "{controller=Chat}/{action=Index}/{id?}")
                 .WithStaticAssets();
 
             app.Run();
