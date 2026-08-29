@@ -27,7 +27,8 @@ public partial class ChatContext : DbContext
     {
         modelBuilder.Entity<message>(entity =>
         {
-            entity.Property(e => e.id).ValueGeneratedNever();
+            // dbo.messages.id is IDENTITY(1,1) - the database generates it.
+            entity.Property(e => e.id).ValueGeneratedOnAdd();
         });
 
         OnModelCreatingPartial(modelBuilder);

@@ -1,33 +1,297 @@
-﻿
 @{
-    ViewData["Title"] = "Index";
+    ViewData["Title"] = "Chat";
 }
 
-<h1>Chat</h1>
-<input type="text" id="txt"/>
-<input type="button" value="send" onclick="send()"/><br />
-<ul id="ul">
+@section Styles {
+	<link rel="stylesheet" href="~/css/chat.css" asp-append-version="true" />
+}
 
-</ul>
+<div class="chat-app">
+	<header class="chat-header">
+		<h1 class="chat-title">
+			<span class="hash">#</span>general
+			<span class="chat-subtitle">Everyone connected to this room</span>
+		</h1>
+		<span class="chat-status" id="status" data-state="offline" role="status" aria-live="polite">
+			<span class="dot"></span><span id="statusText">offline</span>
+		</span>
+	</header>
 
+	<ul class="chat-messages" id="ul" aria-live="polite" aria-atomic="false" aria-label="Messages">
+		<li class="chat-empty" id="empty">
+			<span class="chat-empty-icon">&#128172;</span>
+			<span>No messages yet</span>
+			<small>Say hello to get things started.</small>
+		</li>
+	</ul>
+
+	<form class="chat-composer" id="composer" autocomplete="off">
+		<input type="text" id="txt" class="chat-input" placeholder="Message #general&hellip;"
+			   autocomplete="off" maxlength="500" aria-label="Message" disabled />
+		<button type="submit" class="chat-send" id="sendBtn" aria-label="Send message" disabled>
+			<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+				 stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+				<path d="M22 2 11 13" />
+				<path d="M22 2 15 22l-4-9-9-4z" />
+			</svg>
+		</button>
+	</form>
+
+	<div class="chat-join" id="join" hidden>
+		<div class="chat-join-panel">
+			<div class="chat-join-mark">
+				<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+					 stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+					<path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z" />
+				</svg>
+			</div>
+			<h2>Join the conversation</h2>
+			<p>Pick a display name to start chatting.</p>
+			<input type="text" id="joinName" class="chat-input" placeholder="Your name&hellip;"
+				   maxlength="50" autocomplete="off" aria-label="Display name" />
+			<button type="button" class="chat-join-btn" id="joinBtn">Join chat</button>
+		</div>
+	</div>
+</div>
 
 @section Scripts {
 	<script src="~/microsoft/signalr/dist/browser/signalr.min.js"></script>
 
 	<script>
-		name = prompt("Enter your name");
-		//define the connection
-		connection = new signalR.HubConnectionBuilder().withUrl("/chat").build();
-		//start the connection
-		connection.start();
-		//define callback function
-		connection.on("newmessage",function(n,m){
-			$("#ul").append("<li>"+n+": "+m+"</li>")
-		})
-		//define function to consume server
-		function send(){
-			connection.invoke("sendmessage",name,$("#txt").val())
-		}
+		(function () {
+			"use strict";
 
+			var STORAGE_KEY = "chat.displayName";
+			var GROUP_WINDOW_MS = 2 * 60 * 1000;
+
+			var list = document.getElementById("ul");
+			var empty = document.getElementById("empty");
+			var input = document.getElementById("txt");
+			var sendBtn = document.getElementById("sendBtn");
+			var composer = document.getElementById("composer");
+			var join = document.getElementById("join");
+			var joinName = document.getElementById("joinName");
+			var joinBtn = document.getElementById("joinBtn");
+			var status = document.getElementById("status");
+			var statusText = document.getElementById("statusText");
+
+			// Scoped, unlike the old bare `name = prompt(...)` which wrote to window.name.
+			var displayName = "";
+			var connected = false;
+			var lastSender = null;
+			var lastTime = 0;
+
+			var connection = new signalR.HubConnectionBuilder()
+				.withUrl("/chat")
+				.withAutomaticReconnect()
+				.build();
+
+			// ---------- helpers ----------
+
+			function initials(value) {
+				var parts = value.trim().split(/\s+/).slice(0, 2);
+				return parts.map(function (p) { return p.charAt(0); }).join("").toUpperCase() || "?";
+			}
+
+			// Stable per-name colour so the same person always looks the same.
+			function hueFor(value) {
+				var hash = 0;
+				for (var i = 0; i < value.length; i++) {
+					hash = (hash * 31 + value.charCodeAt(i)) % 360;
+				}
+				return hash;
+			}
+
+			function timeLabel(date) {
+				return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+			}
+
+			function setState(state, label) {
+				status.setAttribute("data-state", state);
+				statusText.textContent = label;
+			}
+
+			function setConnected(value) {
+				connected = value;
+				input.disabled = !value;
+				refreshSendButton();
+			}
+
+			function refreshSendButton() {
+				sendBtn.disabled = !connected || input.value.trim() === "";
+			}
+
+			// ---------- rendering ----------
+
+			function addMessage(sender, text) {
+				// NOTE: this is the CLIENT ARRIVAL time, not the real send time.
+				// The hub only broadcasts (name, message) - no timestamp on the wire.
+				var now = new Date();
+
+				if (empty && empty.parentNode) {
+					empty.parentNode.removeChild(empty);
+				}
+
+				// Scroll only if the reader was already at the bottom, so scrolling
+				// back through history doesn't get yanked away by a new message.
+				var atBottom = list.scrollHeight - list.scrollTop - list.clientHeight < 80;
+
+				// No server-side identity exists, so "mine" is a name comparison:
+				// two people picking the same name will both see it as their own.
+				var own = sender === displayName;
+				var grouped = sender === lastSender && (now.getTime() - lastTime) < GROUP_WINDOW_MS;
+
+				var li = document.createElement("li");
+				li.className = "msg" + (own ? " msg--own" : "") + (grouped ? " msg--grouped" : "");
+
+				var avatar = document.createElement("div");
+				avatar.className = "avatar";
+				avatar.style.backgroundColor = "hsl(" + hueFor(sender) + " 55% 45%)";
+				avatar.setAttribute("aria-hidden", "true");
+				avatar.textContent = initials(sender);
+
+				var body = document.createElement("div");
+				body.className = "msg-body";
+
+				var meta = document.createElement("div");
+				meta.className = "msg-meta";
+
+				var author = document.createElement("span");
+				author.className = "msg-author";
+				// textContent, never innerHTML: the old string-concat append let anyone
+				// broadcast executable markup to every connected browser.
+				author.textContent = own ? "You" : sender;
+
+				var time = document.createElement("time");
+				time.className = "msg-time";
+				time.dateTime = now.toISOString();
+				time.textContent = timeLabel(now);
+
+				var bubble = document.createElement("div");
+				bubble.className = "msg-bubble";
+				bubble.textContent = text;
+
+				meta.appendChild(author);
+				meta.appendChild(time);
+				body.appendChild(meta);
+				body.appendChild(bubble);
+				li.appendChild(avatar);
+				li.appendChild(body);
+				list.appendChild(li);
+
+				lastSender = sender;
+				lastTime = now.getTime();
+
+				if (atBottom) {
+					list.scrollTop = list.scrollHeight;
+				}
+			}
+
+			connection.on("newmessage", function (n, m) {
+				addMessage(n, m);
+			});
+
+			// ---------- connection lifecycle ----------
+
+			connection.onreconnecting(function () {
+				setState("reconnecting", "reconnecting…");
+				setConnected(false);
+			});
+
+			connection.onreconnected(function () {
+				setState("live", "live");
+				setConnected(true);
+			});
+
+			connection.onclose(function () {
+				setState("offline", "offline");
+				setConnected(false);
+			});
+
+			// ---------- sending ----------
+
+			// Kept global for compatibility with anything still calling send().
+			window.send = function () {
+				var text = input.value.trim();
+				if (!connected || text === "") {
+					return;
+				}
+				connection.invoke("sendmessage", displayName, text).catch(function (err) {
+					console.error(err);
+				});
+				input.value = "";
+				refreshSendButton();
+				input.focus();
+			};
+
+			composer.addEventListener("submit", function (e) {
+				e.preventDefault();
+				window.send();
+			});
+
+			input.addEventListener("input", refreshSendButton);
+
+			// ---------- joining ----------
+
+			function readStoredName() {
+				try {
+					return localStorage.getItem(STORAGE_KEY) || "";
+				} catch (e) {
+					return "";
+				}
+			}
+
+			function storeName(value) {
+				try {
+					localStorage.setItem(STORAGE_KEY, value);
+				} catch (e) {
+					/* private mode / storage disabled - not worth failing over */
+				}
+			}
+
+			function start() {
+				setState("connecting", "connecting…");
+				// Awaited before the composer is enabled, so a click can no longer
+				// land before the handshake completes.
+				connection.start().then(function () {
+					setState("live", "live");
+					setConnected(true);
+					input.focus();
+				}).catch(function (err) {
+					console.error(err);
+					setState("offline", "offline");
+					setConnected(false);
+				});
+			}
+
+			function submitJoin() {
+				var value = joinName.value.trim();
+				if (value === "") {
+					joinName.focus();
+					return;
+				}
+				displayName = value;
+				storeName(value);
+				join.hidden = true;
+				start();
+			}
+
+			joinBtn.addEventListener("click", submitJoin);
+			joinName.addEventListener("keydown", function (e) {
+				if (e.key === "Enter") {
+					e.preventDefault();
+					submitJoin();
+				}
+			});
+
+			var stored = readStoredName();
+			if (stored) {
+				displayName = stored;
+				start();
+			} else {
+				join.hidden = false;
+				joinName.focus();
+			}
+		})();
 	</script>
 }
